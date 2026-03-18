@@ -3,6 +3,8 @@ import traceback
 import torch
 import torch.nn as nn
 from .wavefront_api import WavefrontConfig, generate_wavefront_schedule
+from .wavefront_engine import WavefrontEngine
+from .wavefront_kernel import fetch_mapped_context
 import copy
 
 def verify_schedule(config: WavefrontConfig, schedule: list) -> bool:
@@ -144,8 +146,6 @@ def test_backprop_flow():
 
 def test_mapped_fetcher():
     print("Running Test Mapped Fetcher Logic...", end=" ")
-    from wavefront_engine import WavefrontEngine
-    from wavefront_kernel import fetch_mapped_context
     
     # 1. Setup a standard 2D configuration with the new multi-port routing
     config = WavefrontConfig(
@@ -185,7 +185,6 @@ def test_mapped_fetcher():
 
 def test_custom_autograd_equivalence():
     print("Running Test Custom Engine Autograd vs Pure PyTorch...", end=" ")
-    from wavefront_engine import WavefrontEngine
     
     config = WavefrontConfig(
         grid_shape=(2, 3), batch_size=2, dim=4, 
@@ -218,10 +217,8 @@ def test_custom_autograd_equivalence():
     # 2. Setup Our Custom Engine
     x_custom = x_base.clone().requires_grad_(True)
     layers_custom = copy.deepcopy(layers_base)
-    engine = WavefrontEngine(config, layers_custom)
-    
-    # Push the engine's internal routing map to the GPU
-    engine.routing_map = engine.routing_map.to(device)
+    # Push the entire engine (including all buffers) to the GPU at once
+    engine = WavefrontEngine(config, layers_custom).to(device)
     
     output_grids_custom = engine(x_custom)
     # The custom engine returns a list of flattened grids so we grab Port 0 and sum the final cell

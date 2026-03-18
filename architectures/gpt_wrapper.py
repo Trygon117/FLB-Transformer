@@ -15,7 +15,6 @@ class GPTWrapper(nn.Module):
         self.model = GPT2LMHeadModel(config)
 
     def forward(self, x):
-        # Hugging Face models return a CausalLMOutputWithCrossAttentions object.
-        # We extract the logits so they match our benchmarking loop's expectations.
         outputs = self.model(x)
-        return outputs.logits
+        # Return a 0.0 for the auxiliary loss
+        return outputs.logits, 0.0

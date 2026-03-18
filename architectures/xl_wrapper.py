@@ -11,10 +11,13 @@ class XLWrapper(nn.Module):
         self.mems = None
 
     def forward(self, x):
-        # We pass the memory from the previous step to the current one
         outputs = self.model(x, mems=self.mems)
-        self.mems = outputs.mems 
-        return outputs.logits
+        
+        # Detach the memory to prevent an infinite backpropagation loop
+        if outputs.mems is not None:
+            self.mems = [mem.detach() for mem in outputs.mems]
+            
+        return outputs.logits, 0.0
         
     def reset_memory(self):
         self.mems = None

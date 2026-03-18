@@ -8,5 +8,4 @@ class MambaWrapper(nn.Module):
         )
 
     def forward(self, x):
-        # Mamba expects (batch, seq_len) and returns a simple object with logits
-        return self.model(x).logits
+        return self.model(x).logits, 0.0

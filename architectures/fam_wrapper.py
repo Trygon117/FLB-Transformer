@@ -7,10 +7,16 @@ class FAMTransformer(nn.Module):
             nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, batch_first=True),
             num_layers=num_layers
         )
-        self.feedback_compressor = nn.Linear(hidden_dim, hidden_dim) # The "FAM" loop
+        # Deleted the unused feedback_compressor
         self.head = nn.Linear(hidden_dim, vocab_size)
 
     def forward(self, x):
-        # Logic: Current state is influenced by compressed previous states
-        out = self.model(x.float())
-        return self.head(out)
+        # Generate a causal mask to prevent the model from looking into the future
+        seq_len = x.size(1)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=x.device)
+        
+        # Pass the mask into the encoder
+        out = self.model(x.float(), mask=causal_mask, is_causal=True)
+        
+        # Return the logits and a 0.0 for the auxiliary loss
+        return self.head(out), 0.0

@@ -1,0 +1,14 @@
+# Cache and temporary files
+~*/
+__pycache__/
+.ipynb_checkpoints/
+
+# Massive datasets
+wiki_tokens.pt
+
+# Heavy trained models
+models/
+*.pt
+
+# Large CSV logs
+*.csv
