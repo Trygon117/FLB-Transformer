@@ -1,11 +1,21 @@
-from mamba_ssm import MambaLMHeadModel
+from transformers import MambaConfig, MambaForCausalLM
+import torch.nn as nn
 
 class MambaWrapper(nn.Module):
     def __init__(self, vocab_size, hidden_dim, num_layers):
         super().__init__()
-        self.model = MambaLMHeadModel(
-            d_model=hidden_dim, n_layer=num_layers, vocab_size=vocab_size, device='cuda'
+        # Use Hugging Face's native, pure PyTorch Mamba implementation
+        config = MambaConfig(
+            vocab_size=vocab_size,
+            d_model=hidden_dim,
+            n_layer=num_layers,
+            pad_token_id=0,
         )
+        self.model = MambaForCausalLM(config)
 
     def forward(self, x):
-        return self.model(x).logits, 0.0
+        # HF models return an object. We extract the logits.
+        outputs = self.model(x)
+        
+        # Return a 0.0 for the auxiliary loss to keep the benchmarking loop happy
+        return outputs.logits, 0.0

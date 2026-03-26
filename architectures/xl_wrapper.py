@@ -1,11 +1,16 @@
 from transformers import TransfoXLConfig, TransfoXLLMHeadModel
+import torch.nn as nn
 
 class XLWrapper(nn.Module):
     def __init__(self, vocab_size, hidden_dim, num_layers, nhead):
         super().__init__()
         config = TransfoXLConfig(
-            vocab_size=vocab_size, d_model=hidden_dim, 
-            n_layer=num_layers, n_head=nhead
+            vocab_size=vocab_size, 
+            d_model=hidden_dim, 
+            n_layer=num_layers, 
+            n_head=nhead,
+            cutoffs=[],  # Disable adaptive embedding chunks
+            div_val=1    # Force standard embedding math
         )
         self.model = TransfoXLLMHeadModel(config)
         self.mems = None
