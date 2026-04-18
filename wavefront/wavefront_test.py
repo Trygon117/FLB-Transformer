@@ -231,6 +231,80 @@ def test_custom_autograd_equivalence():
     
     print("PASS")
 
+def test_triton_kernel_isolated():
+    print("Running Test Isolated Triton Kernel vs Python...", end=" ")
+    
+    if not torch.cuda.is_available():
+        print("SKIPPED (CUDA not available)")
+        return
+        
+    device = 'cuda'
+    
+    # We test weird shapes here to ensure Triton's BLOCK masks don't bleed
+    test_configs = [
+        {"batch": 1, "dim": 8, "grid": (3, 4)},    # Standard small
+        {"batch": 4, "dim": 32, "grid": (2, 2)},   # Larger batch
+        {"batch": 3, "dim": 12, "grid": (2, 3)},   # Non-power-of-2 dimension to test masking
+        {"batch": 2, "dim": 256, "grid": (4, 4)},  # Large power-of-2 dimension
+    ]
+    
+    for tc in test_configs:
+        config = WavefrontConfig(
+            grid_shape=tc["grid"], 
+            batch_size=tc["batch"], 
+            dim=tc["dim"], 
+            dependencies=[((-1, 0), 0), ((0, -1), 1)],
+            num_ports=2
+        )
+        
+        num_cells = math.prod(config.grid_shape)
+        num_deps = len(config.dependencies)
+        seq_len = config.grid_shape[1]
+        
+        # Setup dummy layers to trick the engine into building our routing map
+        layers = nn.ModuleList([DummyLayer(config.dim, num_deps, config.num_ports) for _ in range(config.grid_shape[0])])
+        engine = WavefrontEngine(config, layers).to(device)
+        
+        # Create dummy inputs on the GPU
+        x_input = torch.randn(config.batch_size, seq_len, config.dim, device=device)
+        
+        # Create stacked grids matching engine expectations: (num_ports, num_cells + 1, batch, dim)
+        stacked_grids = torch.randn(config.num_ports, num_cells + 1, config.batch_size, config.dim, device=device)
+        
+        # Setup inputs for Triton. We simulate a tick where every single cell is active
+        active_cells_list = list(range(num_cells))
+        active_cells_tensor = torch.tensor(active_cells_list, dtype=torch.int32, device=device)
+        
+        # The Engine expects gathered out to be sliced as: (Deps, Max_Cells_Per_Tick, Batch, Dim)
+        gathered_out_triton = torch.zeros((num_deps, len(active_cells_list), config.batch_size, config.dim), device=device)
+        gathered_out_python = torch.zeros_like(gathered_out_triton)
+        
+        # Force the engine to build its buffers since we are bypassing the forward pass
+        engine._init_buffers(x_input)
+        
+        # --- 1. Run Triton Kernel ---
+        from .wavefront_kernel import run_fetch_kernel
+        run_fetch_kernel(
+            x_input, stacked_grids, engine.routing_map, engine.port_map, 
+            engine.spatial_map_buffer, 
+            config, active_cells_tensor, gathered_out_triton
+        )
+        
+        # --- 2. Run Pure Python Equivalent ---
+        # The python fetcher expects a list of pure cell grids without the padding dummy block
+        py_output_grids = [stacked_grids[p][:num_cells] for p in range(config.num_ports)]
+        
+        for i, cell_idx in enumerate(active_cells_list):
+            # fetch_mapped_context returns a list of tensors: [[batch, dim], [batch, dim]]
+            ingredients = fetch_mapped_context(x_input, py_output_grids, cell_idx, engine.routing_map, config)
+            for d in range(num_deps):
+                gathered_out_python[d, i] = ingredients[d]
+                
+        # --- 3. Compare ---
+        assert torch.allclose(gathered_out_python, gathered_out_triton, atol=1e-5), f"Triton kernel math mismatched pure Python for config: {tc}"
+        
+    print("PASS")
+
 def run_all_tests():
     print("=== Starting N-Dimensional Wavefront Test Suite ===")
     tests = [
@@ -238,6 +312,7 @@ def run_all_tests():
         test_custom_3d_video_grid,
         test_backprop_flow,
         test_mapped_fetcher,
+        test_triton_kernel_isolated,
         test_custom_autograd_equivalence
     ]
     

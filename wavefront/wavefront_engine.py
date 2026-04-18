@@ -7,11 +7,14 @@ from torch.amp import custom_fwd, custom_bwd
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from .wavefront_api import WavefrontConfig, generate_wavefront_schedule
 from .wavefront_kernel import run_fetch_kernel
+import wavefront_backend
 
 class WavefrontEngineFunction(torch.autograd.Function):
     @staticmethod
     @custom_fwd(device_type='cuda')
-    def forward(ctx, x, layers, config, routing_map, port_map, active_cells_buffer, active_layers_buffer, gathered_out_buffer, stacked_params, bwd_cache, graph_workspace):
+    def forward(ctx, x, layers, config, routing_map, port_map, active_cells_buffer, active_layers_buffer, gathered_out_buffer, stacked_params, bwd_cache, graph_workspace, spatial_map_buffer, batched_forward, *initial_states):
+        ctx.has_initial_states = [state is not None for state in initial_states]
+        ctx.batched_forward = batched_forward 
         ctx.active_cells_buffer = active_cells_buffer
         ctx.active_layers_buffer = active_layers_buffer
         ctx.gathered_out_buffer = gathered_out_buffer
@@ -46,58 +49,16 @@ class WavefrontEngineFunction(torch.autograd.Function):
         static_x.copy_(x)
 
         with torch.no_grad():
-            def pure_layer_forward(params, *inputs):
-                reshaped_inputs = tuple(inp.unsqueeze(1) for inp in inputs)
-                out_tuple = functional_call(layers[0], params, reshaped_inputs)
-                return tuple(out.squeeze(1) for out in out_tuple)
+            # --- 2. Run the C++ Orchestration Loop ---
+            wavefront_backend.execute_forward(
+                num_ticks, config.num_ports,
+                run_fetch_kernel, batched_forward,
+                active_cells_buffer, static_x, static_stacked_grids,
+                routing_map, port_map, spatial_map_buffer, gathered_out_buffer,
+                bwd_cache, stacked_params, config
+            )
 
-            batched_forward = torch.vmap(pure_layer_forward, randomness="different")
-
-            # 2. Package the entire execution loop into a single reusable function
-            def execute_static_forward():
-                with sdpa_kernel(SDPBackend.MATH):
-                    for tick_idx in range(num_ticks):
-                        cell_indices_tensor = active_cells_buffer[tick_idx]
-                        
-                        # Use static_x and static_stacked_grids instead of the dynamic ones
-                        run_fetch_kernel(
-                            static_x, static_stacked_grids, routing_map, port_map, config, 
-                            cell_indices_tensor, 
-                            gathered_out_buffer[tick_idx]
-                        )
-
-                        tick_cache = bwd_cache[tick_idx]
-                        safe_layer_indices = tick_cache['safe_layer_indices']
-                        valid_cells = tick_cache['valid_cells']
-                        valid_idx = tick_cache['valid_idx']
-
-                        cell_params = {k: v[safe_layer_indices] for k, v in stacked_params.items()}
-
-                        stacked_ingredients = []
-                        for d_idx in range(num_deps):
-                            stacked_ingredients.append(gathered_out_buffer[tick_idx, d_idx])
-
-                        out_tuple = batched_forward(cell_params, *stacked_ingredients)
-
-                        for port_idx in range(config.num_ports):
-                            port_output = out_tuple[port_idx] 
-                            static_stacked_grids[port_idx][valid_cells] = port_output[valid_idx]
-
-            # 3. The Graph Capture Logic
-            if not workspace['is_recorded']:
-                # PyTorch requires us to warm up the engine once before recording
-                torch.cuda.synchronize()
-                execute_static_forward()
-                torch.cuda.synchronize()
-
-                # Turn the cameras on and record the static math track
-                with torch.cuda.graph(workspace['fwd_graph']):
-                    execute_static_forward()
-                
-            # 4. Hit play. The GPU runs the entire track instantly without the CPU.
-            workspace['fwd_graph'].replay()
-
-        # 5. Pick up the final answers from the exit dock
+        # 3. Pick up the final answers from the exit dock
         ctx.save_for_backward(static_x, static_stacked_grids)
         
         final_grids = [static_stacked_grids[p][:num_cells] for p in range(config.num_ports)]
@@ -111,6 +72,8 @@ class WavefrontEngineFunction(torch.autograd.Function):
         # Pull the essentials
         layers = ctx.layers
         config = ctx.config
+
+        batched_forward = ctx.batched_forward
         
         # Pull the flattened memory and scheduling buffers
         active_cells_buffer = ctx.active_cells_buffer
@@ -122,7 +85,7 @@ class WavefrontEngineFunction(torch.autograd.Function):
         bwd_cache = ctx.bwd_cache
         
         # Calculate dynamic shapes
-        num_cells = stacked_grids.shape[1] - 1
+        num_cells = math.prod(config.grid_shape)
         num_deps = len(config.dependencies)
         num_ticks = active_cells_buffer.shape[0]
         
@@ -132,110 +95,69 @@ class WavefrontEngineFunction(torch.autograd.Function):
         static_grad_outputs = workspace['static_grad_outputs']
         
         # Build the static weight accumulator dock exactly once
-        if 'static_grad_accumulators' not in workspace:
-            workspace['static_grad_accumulators'] = {k: torch.zeros_like(v) for k, v in stacked_params.items()}
-        static_grad_accumulators = workspace['static_grad_accumulators']
+        if 'static_cell_grad_accumulators' not in workspace:
+            # We allocate [num_cells, *weight_shape] so every cell writes without atomic locks
+            workspace['static_cell_grad_accumulators'] = {
+                k: torch.zeros((num_cells,) + v.shape[1:], dtype=v.dtype, device=x.device) 
+                for k, v in stacked_params.items()
+            }
+        static_cell_grad_accumulators = workspace['static_cell_grad_accumulators']
 
         # 1. Drop the incoming errors off at the loading dock
         for i, g in enumerate(grad_output_grids):
             if g is not None:
                 static_grad_outputs[i][:num_cells].copy_(g)
 
-        def pure_layer_forward(params, *inputs):
-            reshaped_inputs = tuple(inp.unsqueeze(1) for inp in inputs)
-            out_tuple = functional_call(layers[0], params, reshaped_inputs)
-            return tuple(out.squeeze(1) for out in out_tuple)
+        # --- 2. Build a tiny Python bridge for the C++ code to hit ---
+        def batched_backward_step(cell_params, tracked_stacked_tuple, batched_grads_tuple):
+            _, backward_machine = vjp(batched_forward, cell_params, *tracked_stacked_tuple)
+            return backward_machine(batched_grads_tuple)
 
-        batched_forward = torch.vmap(pure_layer_forward, randomness="different")
+        # --- 3. Fire the C++ Backend ---
+        import wavefront_backend
+        wavefront_backend.execute_backward(
+            num_ticks, config.num_ports, num_deps, num_cells,
+            batched_backward_step,
+            active_cells_buffer, gathered_out_buffer,
+            static_grad_x, static_current_grad_grids, static_grad_outputs,
+            static_cell_grad_accumulators, bwd_cache, stacked_params,
+            config.dependencies
+        )
 
-        # 2. Package the backward loop into the static recorder
-        def execute_static_backward():
-            # Clean the slate. Zero the loading docks before the math begins.
-            static_grad_x.zero_()
-            for g in static_current_grad_grids:
-                g.zero_()
-            for g in static_grad_accumulators.values():
-                g.zero_()
-                
-            # Move the starting errors into the active grid
-            for i in range(config.num_ports):
-                static_current_grad_grids[i][:num_cells].copy_(static_grad_outputs[i][:num_cells])
+        num_layers = config.grid_shape[0]
+        cells_per_layer = num_cells // num_layers
 
-            with sdpa_kernel(SDPBackend.MATH):
-                for tick_idx in reversed(range(num_ticks)):
-                    cell_indices_tensor = active_cells_buffer[tick_idx]
-                    gathered_tensors = gathered_out_buffer[tick_idx]
+        with torch.no_grad():
+            # 1. Reduce the gradients EXACTLY ONCE for all layers
+            reduced_grads = {}
+            for name, param in layers[0].named_parameters():
+                reduced_grads[name] = static_cell_grad_accumulators[name].view(
+                    num_layers, cells_per_layer, *param.shape
+                ).sum(dim=1)
 
-                    tick_cache = bwd_cache[tick_idx]
-                    safe_layer_indices = tick_cache['safe_layer_indices']
-                    valid_idx = tick_cache['valid_idx']
-                    valid_layer_targets = tick_cache['valid_layer_targets']
-
-                    cell_params = {k: v[safe_layer_indices] for k, v in stacked_params.items()}
-
-                    tracked_stacked = []
-                    for i in range(num_deps):
-                        tracked_stacked.append(gathered_tensors[i])
-
-                    out_tuple, backward_machine = vjp(batched_forward, cell_params, *tracked_stacked)
-
-                    batched_grads = []
-                    for port_idx in range(config.num_ports):
-                        # Use the static grids!
-                        port_grads = static_current_grad_grids[port_idx][cell_indices_tensor]
-                        batched_grads.append(port_grads)
-
-                    grad_returns = backward_machine(tuple(batched_grads))
-                    grad_params = grad_returns[0]  
-                    grad_inputs = grad_returns[1:]
-
-                    for name, g in grad_params.items():
-                        if g is not None:
-                            safe_g = g[valid_idx].to(static_grad_accumulators[name].dtype)
-                            static_grad_accumulators[name].index_add_(0, valid_layer_targets, safe_g)
-
-                    for i in range(num_deps):
-                        _, source_port = config.dependencies[i]
-                        dep_cache = tick_cache['deps'][i]
-
-                        dep_grads = grad_inputs[i] 
-                        valid_grads = dep_grads[valid_idx] 
-
-                        if dep_cache['x_targets'].numel() > 0:
-                            static_grad_x.index_add_(1, dep_cache['x_targets'], valid_grads[dep_cache['x_idx']].transpose(0, 1))
-
-                        if dep_cache['grid_targets'].numel() > 0:
-                            static_current_grad_grids[source_port].index_add_(0, dep_cache['grid_targets'], valid_grads[dep_cache['grid_idx']])
-
-        # 3. The Graph Capture Logic
-        if not workspace['is_recorded']:
-            # PyTorch requires us to warm up the engine once before recording
-            torch.cuda.synchronize()
-            execute_static_backward()
-            torch.cuda.synchronize()
-
-            # Turn the cameras on and record the static math track
-            with torch.cuda.graph(workspace['bwd_graph']):
-                execute_static_backward()
-                
-            # Lock the cameras. The engine is permanently built.
-            workspace['is_recorded'] = True
-
-        # 4. Hit play. The GPU runs the backward pass completely independent of Python.
-        workspace['bwd_graph'].replay()
-
-        # 5. Pick the final errors up off the exit dock and apply them to the physical model
-        for i, layer in enumerate(layers):
-            for name, param in layer.named_parameters():
-                # Manually cast the BFloat16 gradient back to FP32
-                grad_to_apply = static_grad_accumulators[name][i].to(param.dtype)
-                
-                if param.grad is None:
-                    param.grad = grad_to_apply
-                else:
-                    param.grad += grad_to_apply
+            # 2. Distribute the pre-calculated gradients
+            for i, layer in enumerate(layers):
+                for name, param in layer.named_parameters():
+                    layer_grad = reduced_grads[name][i].to(param.dtype)
                     
-        return static_grad_x, None, None, None, None, None, None, None, None, None, None
+                    if param.grad is None:
+                        param.grad = layer_grad.clone()
+                    else:
+                        param.grad.add_(layer_grad)
+
+        grad_initial_states = []
+        if hasattr(ctx, 'has_initial_states'):
+            for p, has_state in enumerate(ctx.has_initial_states):
+                if has_state:
+                    grad_initial_states.append(static_current_grad_grids[p][num_cells : num_cells + num_layers].clone())
+                else:
+                    grad_initial_states.append(None)
+        else:
+            grad_initial_states = [None] * config.num_ports
+        
+        standard_returns = [static_grad_x] + [None] * 12
+        
+        return tuple(standard_returns + grad_initial_states)
 
 class WavefrontEngine(nn.Module):
     def __init__(self, config: WavefrontConfig, layers: nn.ModuleList):
@@ -257,15 +179,52 @@ class WavefrontEngine(nn.Module):
         self.active_layers_buffer = None
         self.gathered_out_buffer = None
 
+        def pure_layer_forward(params, *inputs):
+            # 1. Restore the thread-local autocast state stripped by the C++/vmap boundary.
+            # We dynamically use inputs[0].dtype so it perfectly matches the memory dock!
+            with torch.amp.autocast('cuda', dtype=inputs[0].dtype):
+                reshaped_inputs = tuple(inp.unsqueeze(1) for inp in inputs)
+                out_tuple = torch.func.functional_call(self.layers[0], params, reshaped_inputs)
+                
+                # 2. Hard-cast the outputs back to the precise dock dtype just to be safe
+                return tuple(out.squeeze(1).to(inputs[0].dtype) for out in out_tuple)
+
+        self.batched_forward = torch.vmap(pure_layer_forward, randomness="different")
+
     @torch.compiler.disable
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, initial_states: dict = None) -> torch.Tensor:
+        if initial_states is None:
+            initial_states = {}
+            
         self._init_buffers(x)
+        
+        num_cells = math.prod(self.config.grid_shape)
+        # We assume the boundary dock size is equal to the grid's first dimension 
+        boundary_dock_size = self.config.grid_shape[0]
+        
+        # 1. Zero out the old boundary memory
+        self.graph_workspace['static_stacked_grids'][:, num_cells : num_cells + boundary_dock_size].zero_()
+        
+        # 2. Dynamically inject any provided contexts into their respective ports
+        states_list = []
+        for p in range(self.config.num_ports):
+            if p in initial_states:
+                state_tensor = initial_states[p]
+                self.graph_workspace['static_stacked_grids'][p][num_cells : num_cells + boundary_dock_size].copy_(state_tensor)
+                states_list.append(state_tensor)
+            else:
+                states_list.append(None)
+
+        # 3. Fire the Autograd engine, dynamically unpacking the states at the very end
         return WavefrontEngineFunction.apply(
             x, self.layers, self.config, 
             self.routing_map, self.port_map, 
             self.active_cells_buffer, self.active_layers_buffer,
             self.gathered_out_buffer, self.stacked_params,
-            self.bwd_cache, self.graph_workspace
+            self.bwd_cache, self.graph_workspace,
+            self.spatial_map_buffer,
+            self.batched_forward,
+            *states_list
         )
 
     def _init_buffers(self, x):
@@ -283,6 +242,14 @@ class WavefrontEngine(nn.Module):
         num_ticks = len(self.compiled_cells)
         num_deps = len(self.config.dependencies)
         max_cells = self.max_cells_per_tick
+
+        # Pre-compute the modulo math for the Triton kernel to avoid % on the GPU
+        if not hasattr(self, 'spatial_map_buffer') or self.spatial_map_buffer.device != x.device:
+            num_cells = math.prod(self.config.grid_shape)
+            seq_len = self.config.grid_shape[1]
+            # Create the map and pad it with one extra '0' for the dummy cell to prevent out-of-bounds
+            spatial_map = [(i % seq_len) for i in range(num_cells)] + [0]
+            self.spatial_map_buffer = torch.tensor(spatial_map, dtype=torch.int32, device=x.device)
 
         # Move the flat arrays directly to the GPU
         self.active_cells_buffer = torch.tensor(self.compiled_cells, dtype=torch.int32, device=x.device)
@@ -317,9 +284,6 @@ class WavefrontEngine(nn.Module):
                 
                 valid_cells = cell_indices[valid_idx]
                 
-                # Pre-calculate the layer targets for the backward pass
-                valid_layer_targets = layer_indices[valid_idx].long()
-                
                 tick_deps = []
                 for i in range(num_deps):
                     target_indices = self.routing_map[valid_cells * num_deps + i]
@@ -343,7 +307,6 @@ class WavefrontEngine(nn.Module):
                     'safe_layer_indices': safe_layer_indices,
                     'valid_cells': valid_cells,
                     'valid_idx': valid_idx,
-                    'valid_layer_targets': valid_layer_targets,
                     'deps': tick_deps
                 }
 
@@ -353,17 +316,20 @@ class WavefrontEngine(nn.Module):
             seq_len = self.config.grid_shape[1]
             num_cells = math.prod(self.config.grid_shape)
             
-            self.graph_workspace = {
-                'is_recorded': False,
-                'fwd_graph': torch.cuda.CUDAGraph(),
-                'bwd_graph': torch.cuda.CUDAGraph(),
-                
+            # Dynamically calculate the boundary dock size
+            boundary_dock_size = self.config.grid_shape[0]
+            
+            self.graph_workspace = {                
                 'static_x': torch.zeros((batch, seq_len, dim), device=x.device, dtype=compute_dtype),
-                'static_stacked_grids': torch.zeros((self.config.num_ports, num_cells + 1, batch, dim), device=x.device, dtype=compute_dtype),
+                
+                # Replace num_cells + 1 with num_cells + boundary_dock_size
+                'static_stacked_grids': torch.zeros((self.config.num_ports, num_cells + boundary_dock_size, batch, dim), device=x.device, dtype=compute_dtype),
                 
                 'static_grad_x': torch.zeros((batch, seq_len, dim), device=x.device, dtype=compute_dtype),
-                'static_grad_outputs': [torch.zeros((num_cells + 1, batch, dim), device=x.device, dtype=compute_dtype) for _ in range(self.config.num_ports)],
-                'static_current_grad_grids': [torch.zeros((num_cells + 1, batch, dim), device=x.device, dtype=compute_dtype) for _ in range(self.config.num_ports)]
+                
+                # Do the same for the backward memory docks!
+                'static_grad_outputs': [torch.zeros((num_cells + boundary_dock_size, batch, dim), device=x.device, dtype=compute_dtype) for _ in range(self.config.num_ports)],
+                'static_current_grad_grids': [torch.zeros((num_cells + boundary_dock_size, batch, dim), device=x.device, dtype=compute_dtype) for _ in range(self.config.num_ports)]
             }
 
     def _compile_schedule(self):
