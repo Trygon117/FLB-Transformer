@@ -13,8 +13,8 @@ def plot_training_metrics(log_file='training_log.csv', output_dir='plots'):
     
     # --- Plot 1: Main Loss & Aux Loss ---
     plt.figure(figsize=(10, 6))
-    sns.lineplot(data=df, x='global_step', y='loss', label='Cross Entropy Loss')
-    sns.lineplot(data=df, x='global_step', y='aux_loss', label='Auxiliary FLB Loss')
+    sns.lineplot(data=df, x='global_step', y='lang_loss', label='Language Loss')
+    sns.lineplot(data=df, x='global_step', y='aux_loss', label='Auxiliary Loss')
     plt.title('Training Loss over Time')
     plt.xlabel('Global Step')
     plt.ylabel('Loss')

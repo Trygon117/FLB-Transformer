@@ -12,7 +12,8 @@ import wavefront_backend
 class WavefrontEngineFunction(torch.autograd.Function):
     @staticmethod
     @custom_fwd(device_type='cuda')
-    def forward(ctx, x, layers, config, routing_map, port_map, active_cells_buffer, active_layers_buffer, gathered_out_buffer, stacked_params, bwd_cache, graph_workspace, spatial_map_buffer, batched_forward, *initial_states):
+    def forward(ctx, compiled_backward, x, layers, config, routing_map, port_map, active_cells_buffer, active_layers_buffer, gathered_out_buffer, stacked_params, bwd_cache, graph_workspace, spatial_map_buffer, batched_forward, *initial_states):
+        ctx.compiled_backward = compiled_backward
         ctx.has_initial_states = [state is not None for state in initial_states]
         ctx.batched_forward = batched_forward 
         ctx.active_cells_buffer = active_cells_buffer
@@ -96,9 +97,8 @@ class WavefrontEngineFunction(torch.autograd.Function):
         
         # Build the static weight accumulator dock exactly once
         if 'static_cell_grad_accumulators' not in workspace:
-            # We allocate [num_cells, *weight_shape] so every cell writes without atomic locks
             workspace['static_cell_grad_accumulators'] = {
-                k: torch.zeros((num_cells,) + v.shape[1:], dtype=v.dtype, device=x.device) 
+                k: torch.zeros((num_cells + 1,) + v.shape[1:], dtype=v.dtype, device=x.device) 
                 for k, v in stacked_params.items()
             }
         static_cell_grad_accumulators = workspace['static_cell_grad_accumulators']
@@ -108,16 +108,18 @@ class WavefrontEngineFunction(torch.autograd.Function):
             if g is not None:
                 static_grad_outputs[i][:num_cells].copy_(g)
 
-        # --- 2. Build a tiny Python bridge for the C++ code to hit ---
-        def batched_backward_step(cell_params, tracked_stacked_tuple, batched_grads_tuple):
-            _, backward_machine = vjp(batched_forward, cell_params, *tracked_stacked_tuple)
-            return backward_machine(batched_grads_tuple)
+        # --- 2. Define the static function we want to compile
+        # This function takes the parameters, states, and upstream gradients,
+        # and returns the calculated downstream gradients.
+        def static_backward_step(cell_params, tracked_stacked_tuple, batched_grads_tuple):
+            # vjp returns (forward_output, vjp_function)
+            # We use [1] to grab just the vjp_function and immediately pass it the grads
+            return torch.func.vjp(batched_forward, cell_params, *tracked_stacked_tuple)[1](batched_grads_tuple)
 
-        # --- 3. Fire the C++ Backend ---
-        import wavefront_backend
+        # 3. Fire the C++ Backend
         wavefront_backend.execute_backward(
             num_ticks, config.num_ports, num_deps, num_cells,
-            batched_backward_step,
+            ctx.compiled_backward,
             active_cells_buffer, gathered_out_buffer,
             static_grad_x, static_current_grad_grids, static_grad_outputs,
             static_cell_grad_accumulators, bwd_cache, stacked_params,
@@ -131,7 +133,8 @@ class WavefrontEngineFunction(torch.autograd.Function):
             # 1. Reduce the gradients EXACTLY ONCE for all layers
             reduced_grads = {}
             for name, param in layers[0].named_parameters():
-                reduced_grads[name] = static_cell_grad_accumulators[name].view(
+                # FIX: Slice [:num_cells] to ignore the dummy cell's trash data
+                reduced_grads[name] = static_cell_grad_accumulators[name][:num_cells].view(
                     num_layers, cells_per_layer, *param.shape
                 ).sum(dim=1)
 
@@ -155,7 +158,7 @@ class WavefrontEngineFunction(torch.autograd.Function):
         else:
             grad_initial_states = [None] * config.num_ports
         
-        standard_returns = [static_grad_x] + [None] * 12
+        standard_returns = [None, static_grad_x] + [None] * 12
         
         return tuple(standard_returns + grad_initial_states)
 
@@ -180,16 +183,57 @@ class WavefrontEngine(nn.Module):
         self.gathered_out_buffer = None
 
         def pure_layer_forward(params, *inputs):
-            # 1. Restore the thread-local autocast state stripped by the C++/vmap boundary.
-            # We dynamically use inputs[0].dtype so it perfectly matches the memory dock!
             with torch.amp.autocast('cuda', dtype=inputs[0].dtype):
                 reshaped_inputs = tuple(inp.unsqueeze(1) for inp in inputs)
                 out_tuple = torch.func.functional_call(self.layers[0], params, reshaped_inputs)
-                
-                # 2. Hard-cast the outputs back to the precise dock dtype just to be safe
                 return tuple(out.squeeze(1).to(inputs[0].dtype) for out in out_tuple)
 
         self.batched_forward = torch.vmap(pure_layer_forward, randomness="different")
+
+        # 1. The pure math step (This is what we compile)
+        def core_backward_math(cell_params, tracked_stacked_tuple, batched_grads_tuple):
+            return torch.func.vjp(self.batched_forward, cell_params, *tracked_stacked_tuple)[1](batched_grads_tuple)
+
+        # Compile it ONCE (No max-autotune, preventing OOM crashes)
+        self.compiled_core_backward = torch.compile(core_backward_math, backend="aot_eager")
+
+        # 2. The Bulletproof Sanitizer
+        def static_backward_step(cell_params, tracked_stacked_tuple, batched_grads_tuple):
+            # Extract the absolute physical truth from the first input (x)
+            # This is guaranteed to be [max_cells, Batch, Dim]
+            expected_shape = tracked_stacked_tuple[0].shape 
+            expected_dtype = tracked_stacked_tuple[0].dtype
+            expected_device = tracked_stacked_tuple[0].device
+            
+            safe_grads = []
+            for g in batched_grads_tuple:
+                # If C++ sent a null tensor, or a tensor with 0 elements
+                if g is None or g.numel() == 0:
+                    # Provide a REAL block of memory with the correct shape
+                    safe_grads.append(torch.zeros(expected_shape, dtype=expected_dtype, device=expected_device))
+                else:
+                    try:
+                        g.data_ptr() # Test if it has physical storage
+                        safe_grads.append(g)
+                    except RuntimeError:
+                        safe_grads.append(torch.zeros(expected_shape, dtype=expected_dtype, device=expected_device))
+                        
+            safe_tracked = []
+            for t in tracked_stacked_tuple:
+                if t is None or t.numel() == 0:
+                    safe_tracked.append(torch.zeros(expected_shape, dtype=expected_dtype, device=expected_device))
+                else:
+                    try:
+                        t.data_ptr()
+                        safe_tracked.append(t)
+                    except RuntimeError:
+                        safe_tracked.append(torch.zeros(expected_shape, dtype=expected_dtype, device=expected_device))
+
+            # Pass the safely allocated physical memory to the compiler
+            return self.compiled_core_backward(cell_params, tuple(safe_tracked), tuple(safe_grads))
+
+        # Attach to the class
+        self.compiled_backward = static_backward_step
 
     @torch.compiler.disable
     def forward(self, x: torch.Tensor, initial_states: dict = None) -> torch.Tensor:
@@ -217,6 +261,7 @@ class WavefrontEngine(nn.Module):
 
         # 3. Fire the Autograd engine, dynamically unpacking the states at the very end
         return WavefrontEngineFunction.apply(
+            self.compiled_backward,
             x, self.layers, self.config, 
             self.routing_map, self.port_map, 
             self.active_cells_buffer, self.active_layers_buffer,

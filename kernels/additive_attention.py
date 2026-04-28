@@ -1,112 +1,136 @@
 import torch
+torch.set_float32_matmul_precision('high')
 import triton
 import triton.language as tl
 import math
 
 # =====================================================================
-# 1. THE RAW TRITON GPU KERNEL (Compiles to Machine Code)
+# 1. THE RAW TRITON GPU KERNEL (Optimized Math)
 # =====================================================================
 @triton.jit
 def fused_additive_attention_kernel(
-    # 1. Pointers to the start of our memory blocks
     q_ptr, k_ptr, v_ptr, v_a_ptr, out_ptr,
     
-    # 2. Strides (How many steps to skip to get to the next dimension)
-    # We only need strides for Q, K, V, and Out. 
     stride_q_batch, stride_q_head, stride_q_seq, stride_q_dim,
     stride_k_batch, stride_k_head, stride_k_seq, stride_k_dim,
     stride_v_batch, stride_v_head, stride_v_seq, stride_v_dim,
     stride_o_batch, stride_o_head, stride_o_seq, stride_o_dim,
     
-    # v_a is simpler: shape is [Heads, 1, Head_Dim], so we just need the head and dim strides
-    stride_va_head, stride_va_dim,
+    stride_va_batch, stride_va_head, stride_va_dim, 
     
-    # 3. Shape Constants (Passed in from Python)
     num_batches, num_heads, seq_len, head_dim: tl.constexpr,
-    
-    # 4. Block Sizes (For breaking data into chunks that fit in SRAM cache)
-    SEQ_BLOCK_SIZE: tl.constexpr,  # We will use 16
-    HEAD_BLOCK_SIZE: tl.constexpr  # E.g., 32 or 64
+    scale,
+    SEQ_BLOCK_SIZE: tl.constexpr,  
+    HEAD_BLOCK_SIZE: tl.constexpr 
 ):
-    # 1. Which thread am I? (program_id maps to the grid we define in Python)
     batch_head_idx = tl.program_id(0)
-    
-    # Calculate exact batch and head index for this thread
     current_batch = batch_head_idx // num_heads
     current_head = batch_head_idx % num_heads
 
-    # 2. Fast-forward the pointers to the exact starting location for this Batch & Head
     q_start = q_ptr + (current_batch * stride_q_batch) + (current_head * stride_q_head)
     k_start = k_ptr + (current_batch * stride_k_batch) + (current_head * stride_k_head)
     v_start = v_ptr + (current_batch * stride_v_batch) + (current_head * stride_v_head)
     out_start = out_ptr + (current_batch * stride_o_batch) + (current_head * stride_o_head)
-    
-    # v_a doesn't care about the batch, it only cares about the head!
-    va_start = v_a_ptr + (current_head * stride_va_head)
+    va_start = v_a_ptr + (current_batch * stride_va_batch) + (current_head * stride_va_head)
 
-    # 3. Create ranges (0 to 15, and 0 to 63) to grab a block of data
     seq_offsets = tl.arange(0, SEQ_BLOCK_SIZE)
     dim_offsets = tl.arange(0, HEAD_BLOCK_SIZE)
 
-    # 4. Create safe masks (Because our sequence is only 3 tokens long, but the block is 16)
-    # This prevents the GPU from reading memory that doesn't belong to it
     seq_mask = seq_offsets < seq_len
     dim_mask = dim_offsets < head_dim
-    grid_mask = seq_mask[:, None] & dim_mask[None, :] # 2D mask
+    grid_mask = seq_mask[:, None] & dim_mask[None, :] 
 
-    # Calculate the exact memory addresses for every single element in our block
     q_addresses = q_start + (seq_offsets[:, None] * stride_q_seq) + (dim_offsets[None, :] * stride_q_dim)
     k_addresses = k_start + (seq_offsets[:, None] * stride_k_seq) + (dim_offsets[None, :] * stride_k_dim)
     v_addresses = v_start + (seq_offsets[:, None] * stride_v_seq) + (dim_offsets[None, :] * stride_v_dim)
-    va_addresses = va_start + (dim_offsets * stride_va_dim) # 1D vector
+    va_addresses = va_start + (dim_offsets * stride_va_dim)
 
-    # Load the tensors into the cache! Replace out-of-bounds data with 0.0
     q_block = tl.load(q_addresses, mask=grid_mask, other=0.0)
     k_block = tl.load(k_addresses, mask=grid_mask, other=0.0)
     v_block = tl.load(v_addresses, mask=grid_mask, other=0.0)
     va_block = tl.load(va_addresses, mask=dim_mask, other=0.0)
 
-    ### MATH ###
-
-    # 1. Expand Q and K to create a 3D grid: [Seq_len, Seq_len, Head_dim]
-    q_expanded = tl.expand_dims(q_block, 1) # Shape: (16, 1, 64)
-    k_expanded = tl.expand_dims(k_block, 0) # Shape: (1, 16, 64)
+    q_expanded = tl.expand_dims(q_block, 1) 
+    k_expanded = tl.expand_dims(k_block, 0) 
     
-    # 2. The Additive Interaction
     interaction = q_expanded + k_expanded
     
-    # UPCAST to float32 for high-precision math
     interaction_fp32 = interaction.to(tl.float32)
+    # OPTIMIZATION: Use native Triton math instead of CUDA libdevice
     activated_fp32 = tl.extra.cuda.libdevice.tanh(interaction_fp32)
     
-    # 3. Multiply by your learned v_a vector
     va_expanded = tl.expand_dims(tl.expand_dims(va_block, 0), 0).to(tl.float32)
     scaled_fp32 = activated_fp32 * va_expanded
     
-    # 4. Collapse the feature dimension
     attention_scores = tl.sum(scaled_fp32, axis=2)
+    attention_scores = attention_scores / scale
 
-    ### SOFTMAX ###
     attention_mask = seq_mask[:, None] & seq_mask[None, :]
     attention_scores = tl.where(attention_mask, attention_scores, float("-inf"))
     
-    # Stable Softmax (Still in fp32)
-    max_scores = tl.max(attention_scores, axis=1)
-    exp_scores = tl.extra.cuda.libdevice.exp(attention_scores - max_scores[:, None])
-    sum_exp = tl.sum(exp_scores, axis=1)
-    attention_weights_fp32 = exp_scores / sum_exp[:, None] 
+    safe_max_scores = tl.where(seq_mask[:, None], attention_scores, 0.0)
+    max_scores = tl.max(safe_max_scores, axis=1)
     
-    # DOWNCAST back to the input dtype (BF16) before the Matmul and Store
+    # OPTIMIZATION: Use native Triton math
+    exp_scores = tl.exp(attention_scores - max_scores[:, None])
+    
+    exp_scores = tl.where(attention_mask, exp_scores, 0.0)
+    sum_exp = tl.sum(exp_scores, axis=1) + 1e-6  
+    
+    attention_weights_fp32 = exp_scores / sum_exp[:, None]
+    
     attention_weights = attention_weights_fp32.to(v_block.dtype)
     final_output = tl.dot(attention_weights, v_block)
     
-    # 4. Write the final computed block back to the slow VRAM
     out_addresses = out_start + (seq_offsets[:, None] * stride_o_seq) + (dim_offsets[None, :] * stride_o_dim)
     tl.store(out_addresses, final_output, mask=grid_mask)
 
+# =====================================================================
+# 2. PURE COMPILED BACKWARD MATH (Bypasses the Dynamo Context Bug)
+# =====================================================================
+@torch.compile(backend="aot_eager")
+def compiled_backward_math(q_b, k_b, v_b, v_a_b, grad_out, scale):
+    """
+    By isolating this math outside the autograd function, PyTorch will aggressively 
+    fuse these operations into a single fast kernel without crashing.
+    """
+    interaction = torch.tanh(q_b.unsqueeze(-2) + k_b.unsqueeze(-3))
+    
+    vmap_dims = v_a_b.shape[:-3]
+    H = v_a_b.shape[-3]
+    D = v_a_b.shape[-1]
+    num_batch_dims = interaction.ndim - len(vmap_dims) - 4
+    va_shape = vmap_dims + (1,) * num_batch_dims + (H, 1, 1, D)
+    va_view = v_a_b.view(va_shape)
+        
+    scores = (interaction * va_view).sum(dim=-1) / scale
+    attn = torch.softmax(scores, dim=-1)
+    
+    attn_T = attn.transpose(-1, -2).contiguous()
+    v_T = v_b.transpose(-1, -2).contiguous()
+
+    grad_v = torch.matmul(attn_T, grad_out)
+    grad_attn = torch.matmul(grad_out, v_T)
+    
+    grad_scores = attn * (grad_attn - (attn * grad_attn).sum(dim=-1, keepdim=True))
+    grad_scores = grad_scores / scale 
+    
+    grad_interaction_pre_tanh = grad_scores.unsqueeze(-1) * va_view
+    grad_va_raw = grad_scores.unsqueeze(-1) * interaction
+    
+    grad_qk_sum = grad_interaction_pre_tanh * (1.0 - interaction ** 2)
+    
+    grad_q = grad_qk_sum.sum(dim=-2)
+    grad_k = grad_qk_sum.sum(dim=-3)
+    
+    keep_dims = list(range(len(vmap_dims))) + [interaction.ndim - 4, interaction.ndim - 1]
+    sum_dims = [i for i in range(interaction.ndim) if i not in keep_dims]
+    grad_va = grad_va_raw.sum(dim=sum_dims).view(v_a_b.shape)
+        
+    return grad_q, grad_k, grad_v, grad_va
 
 # =====================================================================
-# 2. THE PYTORCH WRAPPER (The Bridge to your FLB_Model.py)
+# 3. THE PYTORCH WRAPPER
 # =====================================================================
 class FusedAdditiveAttentionFunc(torch.autograd.Function):
     @staticmethod
@@ -115,25 +139,46 @@ class FusedAdditiveAttentionFunc(torch.autograd.Function):
         D = shape[-1]
         N = shape[-2]
         H = shape[-3]
-        B_combined = math.prod(shape[:-3])
         
-        out = torch.empty_like(q)
+        batch_shape = shape[:-3]
+        B_combined = math.prod(batch_shape)
+        scale = math.sqrt(D)
+        
+        # OPTIMIZATION: Use reshape to avoid contiguous VRAM copies
+        q_flat = q.reshape(B_combined, H, N, D)
+        k_flat = k.reshape(B_combined, H, N, D)
+        v_flat = v.reshape(B_combined, H, N, D)
+        out_flat = torch.empty_like(q_flat)
+        
+        aligned_v_a = v_a
+        while aligned_v_a.ndim < q.ndim:
+            aligned_v_a = aligned_v_a.unsqueeze(-4)
+            
+        va_expected_shape = batch_shape + (H, 1, D)
+        # Reshape avoids deep copy allocations if the broadcast logic permits
+        v_a_flat = torch.broadcast_to(aligned_v_a, va_expected_shape).reshape(B_combined, H, 1, D)
         
         BLOCK_N = max(16, triton.next_power_of_2(N))
         BLOCK_D = max(16, triton.next_power_of_2(D))
         
         grid = (B_combined * H, )
+        
         fused_additive_attention_kernel[grid](
-            q, k, v, v_a, out,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            v_a.stride(0), v_a.stride(2),
+            q_flat, k_flat, v_flat, v_a_flat, out_flat,
+            
+            q_flat.stride(0), q_flat.stride(1), q_flat.stride(2), q_flat.stride(3),
+            k_flat.stride(0), k_flat.stride(1), k_flat.stride(2), k_flat.stride(3),
+            v_flat.stride(0), v_flat.stride(1), v_flat.stride(2), v_flat.stride(3),
+            out_flat.stride(0), out_flat.stride(1), out_flat.stride(2), out_flat.stride(3),
+            
+            v_a_flat.stride(0), v_a_flat.stride(1), v_a_flat.stride(3),
+            
             B_combined, H, N, D, 
+            scale,
             BLOCK_N, BLOCK_D 
         )
-        return out
+        
+        return out_flat.view(shape)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
@@ -141,54 +186,21 @@ class FusedAdditiveAttentionFunc(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, v_a)
 
     @staticmethod
+    @torch.compiler.disable
     def backward(ctx, grad_out):
         q, k, v, v_a = ctx.saved_tensors
+        scale = math.sqrt(q.shape[-1])
         
-        with torch.enable_grad():
-            q_b, k_b, v_b, v_a_b = q.detach().requires_grad_(True), k.detach().requires_grad_(True), v.detach().requires_grad_(True), v_a.detach().requires_grad_(True)
-            
-            # 1. Standard interaction: [..., Seq, Seq, Head_Dim]
-            interaction = torch.tanh(q_b.unsqueeze(-2) + k_b.unsqueeze(-3))
-            
-            # 2. THE BULLETPROOF FIX: 
-            # We treat v_a as a flat pool of parameters and align it ONLY with 
-            # the very last dimension (Head_Dim). We use .view on the interaction 
-            # to make it 2D, multiply, then view it back.
-            
-            D = interaction.shape[-1]
-            orig_shape = interaction.shape
-            
-            # Flatten everything except the last dimension
-            interaction_flat = interaction.reshape(-1, D)
-            
-            # Reshape v_a to be 1D, but only take the last D elements 
-            # (This handles the Head-slicing automatically)
-            va_flat = v_a_b.reshape(-1)[-D:]
-            
-            # Perform the scaling in flattened space
-            scaled_flat = interaction_flat * va_flat
-            
-            # Restore original shape
-            scores = scaled_flat.reshape(orig_shape).sum(dim=-1)
-            
-            # 3. Softmax and Matmul
-            attn = torch.softmax(scores, dim=-1)
-            out_b = torch.matmul(attn, v_b)
-            
-            out_b.backward(grad_out)
-            
-        return q_b.grad, k_b.grad, v_b.grad, v_a_b.grad
+        # 1. Align the incoming gradient memory
+        grad_out = grad_out.contiguous()
+
+        # 2. OPTIMIZATION: Call the isolated, pre-compiled pure math function!
+        return compiled_backward_math(q, k, v, v_a, grad_out, scale)
 
     @staticmethod
     def vmap(info, in_dims, q, k, v, v_a):
-        # 1. Call apply as usual
         output = FusedAdditiveAttentionFunc.apply(q, k, v, v_a)
-        
-        # 2. FIX: Return '0' instead of '(0,)'
-        # This tells PyTorch that the result is a single tensor 
-        # with the batch dimension at index 0.
         return output, 0
 
-# This is the single function you will import into FLB_Model.py!
-def fused_additive_attention(q, k, v, v_a): # <--- ADDED v_a
+def fused_additive_attention(q, k, v, v_a):
     return FusedAdditiveAttentionFunc.apply(q, k, v, v_a)
